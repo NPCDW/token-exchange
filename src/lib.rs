@@ -1,27 +1,18 @@
-use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
-use tower_service::Service;
 use worker::*;
 
-fn router(_env: Env) -> Router {
-    Router::new().route("/trakt", post(trakt)).with_state(AxumState {
-        env_wrapper: _env,
-    })
-}
-
-#[derive(Clone)]
-pub struct AxumState {
-    pub env_wrapper: Env,
-}
-
 #[event(fetch)]
-async fn fetch(
-    req: HttpRequest,
-    _env: Env,
-    _ctx: Context,
-) -> Result<axum::http::Response<axum::body::Body>> {
+pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Response> {
     console_error_panic_hook::set_once();
-    Ok(router(_env).call(req).await?)
+    let router = Router::new();
+    router
+        .get_async("/hi", |_req, _ctx| async move {
+            Response::from_html("<h1>Hello, Cloudflare Worker!</h1>")
+        })
+        .post_async("/trakt", |req, ctx| async move {
+            trakt(req, ctx).await
+        })
+        .run(req, env).await
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -41,29 +32,25 @@ pub struct TraktExchangeTokenParam {
     pub grant_type: String,
 }
 
-pub async fn trakt(State(state): State<AxumState>, body: Json<TraktParam>) -> axum::response::Response {
+pub async fn trakt(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let body = match req.text().await {
+        Ok(body) => body,
+        Err(e) => return Response::error(format!("body is error: {}", e), 400),
+    };
+    let body: TraktParam = match serde_json::from_str(&body) {
+        Ok(body) => body,
+        Err(e) => return Response::error(format!("body is error: {}", e), 400),
+    };
     if body.code.is_none() && body.refresh_token.is_none() {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            axum::http::HeaderMap::new(),
-            axum::body::Body::new("refresh_token and code cannot both be empty".to_string())
-        ).into_response();
+        return Response::error("refresh_token and code cannot both be empty", 400);
     }
-    let client_id = state.env_wrapper.var("TRAKT_CLIENT_ID");
+    let client_id = ctx.env.var("TRAKT_CLIENT_ID");
     if let Err(_) = client_id {
-        return (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            axum::http::HeaderMap::new(),
-            axum::body::Body::new("TRAKT_CLIENT_ID is error".to_string())
-        ).into_response();
+        return Response::error("TRAKT_CLIENT_ID is error", 503);
     }
-    let client_secret = state.env_wrapper.var("TRAKT_CLIENT_SECRET");
+    let client_secret = ctx.env.var("TRAKT_CLIENT_SECRET");
     if let Err(_) = client_id {
-        return (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            axum::http::HeaderMap::new(),
-            axum::body::Body::new("TRAKT_CLIENT_SECRET is error".to_string())
-        ).into_response();
+        return Response::error("TRAKT_CLIENT_SECRET is error", 503);
     }
 
     let grant_type = match &body.code {
@@ -79,29 +66,19 @@ pub async fn trakt(State(state): State<AxumState>, body: Json<TraktParam>) -> ax
         grant_type: grant_type.to_string(),
     }) {
         Ok(body) => body,
-        Err(_) => return (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            axum::http::HeaderMap::new(),
-            axum::body::Body::new("serde_json to_string error".to_string())
-        ).into_response(),
+        Err(_) => return Response::error("serde_json to_string error", 500),
     };
     let res = reqwest::Client::new()
         .post("https://api.trakt.tv/oauth/token")
-        .header(axum::http::header::CONTENT_TYPE, axum::http::HeaderValue::from_static("application/json"))
+        .header(reqwest::header::CONTENT_TYPE, reqwest::header::HeaderValue::from_static("application/json"))
         .body(body)
         .send()
         .await;
-    if let Err(err) = res {
-        return (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            axum::http::HeaderMap::new(),
-            axum::body::Body::new(err.to_string())
-        ).into_response()
+    match res {
+        Err(err) => return Response::error(format!("reqwest request error: {}", err), 500),
+        Ok(response) => return Ok(Response::builder()
+            .with_status(response.status().as_u16())
+            .with_headers(response.headers().clone().into())
+            .body(ResponseBody::Body(response.bytes().await.unwrap().to_vec()))),
     }
-    let response = res.unwrap();
-    return (
-        response.status(),
-        response.headers().clone(),
-        axum::body::Body::from_stream(response.bytes_stream())
-    ).into_response();
 }
